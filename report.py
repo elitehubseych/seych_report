@@ -229,7 +229,10 @@ def is_event(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
     event_type = payload.get("type")
-    return isinstance(event_type, str) and ("message" in event_type or event_type == "button_event")
+    return isinstance(event_type, str) and (
+        "message" in event_type
+        or event_type in ("button_event", "message_event", "board_post_new")
+    )
 
 
 class VKError(Exception):
@@ -377,23 +380,25 @@ class VK:
             return result[0]
         return {}
 
-    async def purge_messages(self, peer_id: int, cmids: list[int]) -> int:
-        if not peer_id or not cmids:
-            return 0
-        removed = 0
-        for start in range(0, len(cmids), 100):
-            chunk = ",".join(str(value) for value in cmids[start : start + 100])
-            try:
-                result = await self.call(
-                    "messages.delete", peer_id=peer_id, cmids=chunk, delete_for_all=1
-                )
-            except VKError as exc:
-                logger.warning("Не удалось удалить сообщения в чате %s: %s", peer_id, exc)
-                continue
-            for item in result if isinstance(result, list) else []:
-                if isinstance(item, dict) and to_int(item.get("response")):
-                    removed += 1
-        return removed
+    async def delete_board_comment(self, topic_id: int, comment_id: int) -> bool:
+        if not topic_id or not comment_id:
+            return False
+        try:
+            await self.call(
+                "board.deleteComment",
+                group_id=self.group_id,
+                topic_id=topic_id,
+                comment_id=comment_id,
+            )
+            return True
+        except VKError as exc:
+            logger.warning(
+                "Не удалось удалить комментарий %s в обсуждении %s: %s",
+                comment_id,
+                topic_id,
+                exc,
+            )
+            return False
 
 
 class Database:
@@ -457,55 +462,55 @@ class Database:
         )
         await self.pool.execute(
             """
-            CREATE TABLE IF NOT EXISTS rep_seen (
-                peer_id BIGINT NOT NULL,
-                cmid BIGINT NOT NULL,
+            CREATE TABLE IF NOT EXISTS rep_board_seen (
+                topic_id BIGINT NOT NULL,
+                comment_id BIGINT NOT NULL,
                 user_id BIGINT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (peer_id, cmid)
+                PRIMARY KEY (topic_id, comment_id)
             )
             """
         )
         await self.pool.execute(
-            "CREATE INDEX IF NOT EXISTS rep_seen_user ON rep_seen (user_id)"
+            "CREATE INDEX IF NOT EXISTS rep_board_seen_user ON rep_board_seen (user_id)"
         )
 
-    async def save_seen(self, peer_id: int, cmid: int, user_id: int) -> None:
-        if not peer_id or not cmid or user_id <= 0:
+    async def save_board_seen(self, topic_id: int, comment_id: int, user_id: int) -> None:
+        if not topic_id or not comment_id or user_id <= 0:
             return
         try:
             await self.pool.execute(
                 """
-                INSERT INTO rep_seen (peer_id, cmid, user_id) VALUES ($1, $2, $3)
-                ON CONFLICT (peer_id, cmid) DO NOTHING
+                INSERT INTO rep_board_seen (topic_id, comment_id, user_id) VALUES ($1, $2, $3)
+                ON CONFLICT (topic_id, comment_id) DO NOTHING
                 """,
-                peer_id,
-                cmid,
+                topic_id,
+                comment_id,
                 user_id,
             )
         except Exception as exc:
-            logger.warning("Не удалось сохранить сообщение %s: %s", cmid, exc)
+            logger.warning("Не удалось сохранить комментарий %s: %s", comment_id, exc)
 
-    async def seen_by_user(self, user_id: int) -> list[asyncpg.Record]:
+    async def board_by_user(self, user_id: int) -> list[asyncpg.Record]:
         return list(
             await self.pool.fetch(
-                "SELECT peer_id, cmid FROM rep_seen WHERE user_id = $1 ORDER BY created_at",
+                "SELECT topic_id, comment_id FROM rep_board_seen WHERE user_id = $1 ORDER BY created_at",
                 user_id,
             )
         )
 
-    async def forget_seen(self, user_id: int, peer_id: int, cmids: list[int]) -> None:
-        if not cmids:
+    async def forget_board(self, user_id: int, topic_id: int, comment_ids: list[int]) -> None:
+        if not comment_ids:
             return
         try:
             await self.pool.execute(
-                "DELETE FROM rep_seen WHERE user_id = $1 AND peer_id = $2 AND cmid = ANY($3::bigint[])",
+                "DELETE FROM rep_board_seen WHERE user_id = $1 AND topic_id = $2 AND comment_id = ANY($3::bigint[])",
                 user_id,
-                peer_id,
-                cmids,
+                topic_id,
+                comment_ids,
             )
         except Exception as exc:
-            logger.warning("Не удалось очистить журнал сообщений: %s", exc)
+            logger.warning("Не удалось очистить журнал комментариев: %s", exc)
 
     async def close(self) -> None:
         if self.pool is not None:
@@ -652,6 +657,8 @@ class ReportBot:
         if event_type in ("button_event", "message_event"):
             logger.info("событие %s", event_type)
             await self.on_button(obj)
+        elif event_type == "board_post_new":
+            await self.on_board_comment(obj)
         elif "message" in event_type:
             await self.on_message(obj)
 
@@ -670,17 +677,8 @@ class ReportBot:
         logger.info(
             "chat %s | user %s | cmid %s | id %s | %s", peer_id, from_id, cmid, mid, text
         )
-        muted = False
-        if peer_id in READ_CHATS and not self.is_admin(from_id):
-            if await self.db.get_mute(from_id) is not None:
-                muted = True
-                await self.vk.delete(peer_id, cmid)
-        if not muted and from_id > 0 and cmid and (peer_id in READ_CHATS or peer_id == CHAT_REPLY):
-            await self.db.save_seen(peer_id, cmid, from_id)
         if command in REPORT_COMMANDS and peer_id in READ_CHATS:
-            await self.on_user_message(
-                peer_id, from_id, text, cmid, message, mid, muted=muted
-            )
+            await self.on_user_message(peer_id, from_id, text, cmid, message, mid)
             return
         if peer_id != CHAT_REPLY:
             return
@@ -703,18 +701,19 @@ class ReportBot:
         cmid: int,
         message: dict,
         mid: int = 0,
-        muted: bool = False,
     ) -> None:
         command, rest = split_command(text)
         if command not in REPORT_COMMANDS:
             return
-        if muted or await self.db.get_mute(from_id) is not None:
-            mute = await self.db.get_mute(from_id)
-            left = humanize(to_int(mute["until_ts"]) - now_ts()) if mute else ""
+        mute = await self.db.get_mute(from_id)
+        if mute is not None:
+            left = humanize(to_int(mute["until_ts"]) - now_ts())
             await self.vk.send(
                 peer_id,
                 f"🚫 {await self.vk.mention(from_id)}, у вас заблокирован доступ к репорту."
                 f"\nОсталось до снятия: {left}",
+                reply_cmid=cmid,
+                reply_mid=mid,
             )
             return
         reply = extract_reply(message)
@@ -905,36 +904,56 @@ class ReportBot:
             )
             return
         until_ts = now_ts() + seconds
-        removed, chats = await self.purge_user(target_id)
         await self.db.set_mute(target_id, admin_id, reason, until_ts)
+        removed, topics = await self.purge_board(target_id)
         target_name = await self.vk.mention(target_id)
-        note = (
-            f"\n🧹 Удалено сообщений: {removed} в обсуждениях: {chats}"
-            if removed or chats
-            else "\n🧹 Его сообщений в обсуждениях не найдено"
-        )
         await self.vk.send(
             peer_id,
             f"🔇 Вы успешно выдали мут репорта {target_name} на {humanize(seconds)}"
-            f"\nПричина: {reason}{note}",
+            f"\nПричина: {reason}",
             reply_cmid=cmid,
         )
         await self.broadcast(
             f"👮 {await self.vk.mention(admin_id)} выдал мут репорта {target_name}"
-            f" на {humanize(seconds)}\nПричина: {reason}\n🧹 Удалено сообщений: {removed}"
+            f" на {humanize(seconds)}\nПричина: {reason}"
         )
 
-    async def purge_user(self, user_id: int) -> tuple[int, int]:
-        rows = await self.db.seen_by_user(user_id)
-        by_peer: dict[int, list[int]] = {}
+    async def purge_board(self, user_id: int) -> tuple[int, int]:
+        rows = await self.db.board_by_user(user_id)
+        by_topic: dict[int, list[int]] = {}
         for row in rows:
-            by_peer.setdefault(to_int(row["peer_id"]), []).append(to_int(row["cmid"]))
+            by_topic.setdefault(to_int(row["topic_id"]), []).append(to_int(row["comment_id"]))
         removed = 0
-        for peer, cmids in by_peer.items():
-            gone = await self.vk.purge_messages(peer, cmids)
-            removed += gone
-            await self.db.forget_seen(user_id, peer, cmids)
-        return removed, len(by_peer)
+        for topic, cids in by_topic.items():
+            for cid in cids:
+                if await self.vk.delete_board_comment(topic, cid):
+                    removed += 1
+            await self.db.forget_board(user_id, topic, cids)
+        if removed or by_topic:
+            logger.info(
+                "мут %s: удалено комментариев %s в обсуждениях %s",
+                user_id,
+                removed,
+                len(by_topic),
+            )
+        return removed, len(by_topic)
+
+    async def on_board_comment(self, obj: dict) -> None:
+        topic_id = to_int(obj.get("topic_id"))
+        comment_id = to_int(obj.get("id"))
+        user_id = to_int(obj.get("from_id"))
+        if not topic_id or not comment_id or user_id <= 0:
+            return
+        if await self.db.get_mute(user_id) is not None:
+            await self.vk.delete_board_comment(topic_id, comment_id)
+            logger.info(
+                "мут %s: снесён комментарий %s в обсуждении %s",
+                user_id,
+                comment_id,
+                topic_id,
+            )
+            return
+        await self.db.save_board_seen(topic_id, comment_id, user_id)
 
     async def unmute_user(self, peer_id: int, admin_id: int, cmid: int, rest: str) -> None:
         target_id, _ = extract_target(rest)
