@@ -682,7 +682,7 @@ class ReportBot:
                 peer_id, from_id, text, cmid, message, mid, muted=muted
             )
             return
-        if peer_id != CHAT_REPLY or not self.is_admin(from_id):
+        if peer_id != CHAT_REPLY:
             return
         if command in MUTE_COMMANDS:
             await self.mute_user(peer_id, from_id, cmid, rest)
@@ -788,7 +788,9 @@ class ReportBot:
         if not reply_cmid:
             return
         report = await self.db.find_report_by_cmid(reply_cmid)
-        if report is None or report["status"] == "done":
+        if report is None or report["status"] != "taken":
+            return
+        if to_int(report["prompt_cmid"]) != reply_cmid:
             return
         answer = truncate(text, 900)
         user_chat = to_int(report["peer_id"]) or next(iter(READ_CHATS), 0)
@@ -825,9 +827,6 @@ class ReportBot:
         )
         if not report_id or action not in ("rep", "rpc"):
             logger.warning("неизвестная кнопка: %r", raw)
-            return
-        if not self.is_admin(admin_id):
-            logger.warning("кнопка от не-админа %s", admin_id)
             return
         report = await self.db.get_report(report_id)
         if report is None:
