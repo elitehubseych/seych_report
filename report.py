@@ -677,7 +677,7 @@ class ReportBot:
         logger.info(
             "chat %s | user %s | cmid %s | id %s | %s", peer_id, from_id, cmid, mid, text
         )
-        if command in REPORT_COMMANDS and peer_id in READ_CHATS:
+        if command in REPORT_COMMANDS and (peer_id in READ_CHATS or peer_id == from_id):
             await self.on_user_message(peer_id, from_id, text, cmid, message, mid)
             return
         if peer_id != CHAT_REPLY:
